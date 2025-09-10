@@ -1,11 +1,18 @@
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Scanner;
 
 public class BlackjackClient {
+    private static long clockOffset = 0;
+    private static final DateTimeFormatter TIME_FORMATTER = 
+        DateTimeFormatter.ofPattern("HH:mm:ss.SSS").withZone(ZoneId.systemDefault());
+
     public static void main(String[] args) {
         try {
             Registry registry = LocateRegistry.getRegistry("localhost", 1099);
@@ -13,54 +20,47 @@ public class BlackjackClient {
             Scanner scanner = new Scanner(System.in);
 
             System.out.print("Enter your player name: ");
-            String playerName = scanner.nextLine();
+            String playerName = scanner.nextLine().trim();
             String joinResponse = service.joinGame(playerName);
             System.out.println(joinResponse);
             
-            if (joinResponse.startsWith("ERROR")) {
-                return;
-            }
+            if (joinResponse.startsWith("ERROR")) return;
 
-            // The main game loop.
+            synchronizeClock(service);
+
             while (true) {
                 GameState gameState = service.getGameState();
                 Player.Status myStatus = gameState.getPlayerStati().get(playerName);
-                String currentTurnPlayer = gameState.getCurrentPlayerTurn();
 
-                // ### ACTION LOGIC ###
-                // If it's time for this client's player to act...
-                if (myStatus == Player.Status.BETTING) {
-                    clearConsole();
-                    displayGameState(gameState, playerName);
-                    System.out.print(">>> Place your bet: ");
-                    try {
-                        double bet = Double.parseDouble(scanner.nextLine());
-                        service.placeBet(playerName, bet);
-                        // After betting, loop will continue in observer mode.
-                    } catch (NumberFormatException e) {
-                        System.out.println("Invalid bet amount. Pausing for 2 seconds...");
-                        Thread.sleep(2000);
-                    }
-                } else if (playerName != null && playerName.equals(currentTurnPlayer)) {
-                    // It's our turn to hit or stand. Enter a dedicated handler.
-                    handlePlayerTurn(service, scanner, playerName);
-                } else {
-                    // ### OBSERVER LOGIC ###
-                    // If we are just waiting, display the state once, then wait silently
-                    // for a change to avoid flashing the screen repeatedly.
+                // FIX: This new structure separates "Action Mode" from "Observer Mode".
+                if (myStatus == Player.Status.WAITING_FOR_BET || myStatus == Player.Status.PLAYING_TURN) {
+                    // ACTION MODE: Draw the screen once and wait for blocking input.
+                    // This completely prevents the "erased input" glitch.
                     clearConsole();
                     displayGameState(gameState, playerName);
 
-                    // Poll silently until the state changes
-                    while (true) {
-                        Thread.sleep(1000); // Check for an update every second
-                        GameState newState = service.getGameState();
-                        // If the turn moves or the round ends, the message will change.
-                        // This is our cue to break and re-render the screen.
-                        if (!newState.getGameMessage().equals(gameState.getGameMessage())) {
-                            break;
+                    if (myStatus == Player.Status.WAITING_FOR_BET) {
+                        System.out.print(">>> Place your bet: ");
+                        try {
+                            double bet = Double.parseDouble(scanner.nextLine());
+                            service.placeBet(playerName, bet);
+                        } catch (NumberFormatException e) {
+                            service.placeBet(playerName, 0); // Send an invalid bet to keep turn
+                        }
+                    } else { // PLAYING_TURN
+                        System.out.print(">>> Your action (h)it or (s)tand: ");
+                        String choice = scanner.nextLine();
+                        if ("h".equalsIgnoreCase(choice)) {
+                            service.hit(playerName);
+                        } else if ("s".equalsIgnoreCase(choice)) {
+                            service.stand(playerName);
                         }
                     }
+                } else {
+                    // OBSERVER MODE: Refresh the screen every second to see live updates.
+                    clearConsole();
+                    displayGameState(gameState, playerName);
+                    Thread.sleep(1000); 
                 }
             }
         } catch (Exception e) {
@@ -69,72 +69,34 @@ public class BlackjackClient {
         }
     }
 
-    /**
-     * A dedicated loop to handle a player's turn (hitting or standing).
-     * This loop continues until the player stands or busts.
-     */
-    private static void handlePlayerTurn(BlackjackService service, Scanner scanner, String playerName) throws Exception {
-        while (true) {
-            GameState turnState = service.getGameState();
-            clearConsole();
-            displayGameState(turnState, playerName);
-
-            // Check if our turn was ended by the server (e.g., a Blackjack)
-            if (!playerName.equals(turnState.getCurrentPlayerTurn())) {
-                break;
-            }
-
-            System.out.print(">>> Your action (h)it or (s)tand: ");
-            String choice = scanner.nextLine();
-
-            if ("h".equalsIgnoreCase(choice)) {
-                service.hit(playerName);
-                // Check if the hit resulted in a bust
-                GameState newState = service.getGameState();
-                if (newState.getPlayerStati().get(playerName) == Player.Status.BUSTED) {
-                    clearConsole();
-                    displayGameState(newState, playerName);
-                    System.out.println(">>> You BUSTED! Waiting for round to end...");
-                    Thread.sleep(2500);
-                    break; // Exit turn loop
-                }
-            } else if ("s".equalsIgnoreCase(choice)) {
-                service.stand(playerName);
-                break; // Exit turn loop
-            }
-        }
+    private static void synchronizeClock(BlackjackService service) throws Exception {
+        System.out.println("\nAttempting clock synchronization with server...");
+        long startTime = System.currentTimeMillis();
+        long serverTime = service.getServerTime();
+        long endTime = System.currentTimeMillis();
+        long rtt = endTime - startTime;
+        long estimatedServerTime = serverTime + (rtt / 2);
+        clockOffset = estimatedServerTime - endTime;
+        System.out.println("Round Trip Time (RTT): " + rtt + " ms");
+        System.out.println("Calculated Clock Offset: " + clockOffset + " ms");
+        System.out.println("Clocks are now synchronized. Press Enter to continue...");
+        new Scanner(System.in).nextLine();
     }
 
-    /**
-     * Calculates the value of a hand, properly handling the value of Aces.
-     */
-    private static int getHandValue(List<Card> hand) {
-        int value = 0;
-        int aceCount = 0;
-        if (hand == null) return 0;
-        for (Card card : hand) {
-            value += card.getValue();
-            if (card.getValue() == 11) { // Card is an Ace
-                aceCount++;
-            }
-        }
-        while (value > 21 && aceCount > 0) {
-            value -= 10;
-            aceCount--;
-        }
-        return value;
+    private static long getSynchronizedTime() {
+        return System.currentTimeMillis() + clockOffset;
     }
 
-    /**
-     * Renders the entire game state to the console.
-     */
     private static void displayGameState(GameState state, String myName) {
         int dealerScore = getHandValue(state.getDealerHand());
+        String localTimeStr = TIME_FORMATTER.format(Instant.ofEpochMilli(System.currentTimeMillis()));
+        String syncTimeStr = TIME_FORMATTER.format(Instant.ofEpochMilli(getSynchronizedTime()));
 
         System.out.println("========================= BLACKJACK =========================");
+        System.out.printf("Local Time: %s | Synchronized Time: %s\n", localTimeStr, syncTimeStr);
+        System.out.println("-----------------------------------------------------------");
         
-        System.out.printf("DEALER [Score: %s]\n", 
-            (state.getDealerHand().stream().anyMatch(c -> c.getValue() == 0)) ? "?" : dealerScore);
+        System.out.printf("DEALER [Score: %d]\n", dealerScore);
         System.out.println("  Hand: " + state.getDealerHand());
         System.out.println("-----------------------------------------------------------");
 
@@ -146,28 +108,45 @@ public class BlackjackClient {
             String turnIndicator = name.equals(state.getCurrentPlayerTurn()) ? "==> " : "    ";
             String youIndicator = name.equals(myName) ? " (You)" : "";
             int playerScore = getHandValue(state.getPlayerHands().get(name));
-
             System.out.printf("%s%-15s | Money: $%-8.2f | Bet: $%-7.2f\n",
-                turnIndicator,
-                name + youIndicator,
+                turnIndicator, name + youIndicator,
                 state.getPlayerMoney().get(name),
-                state.getPlayerBets().get(name)
-            );
-            System.out.printf("    Status: %-12s | Hand [Score: %d]: %s\n\n",
+                state.getPlayerBets().get(name));
+            System.out.printf("    Status: %-18s | Hand [Score: %d]: %s\n\n",
                 state.getPlayerStati().get(name),
                 playerScore,
-                state.getPlayerHands().get(name)
-            );
+                state.getPlayerHands().get(name));
+        }
+        
+        String finalMessage = state.getGameMessage();
+        long endTime = state.getTurnEndTime();
+        String activePlayer = state.getCurrentPlayerTurn();
+        
+        // FIX: Display a static message for the active player, and a live countdown for observers.
+        if (activePlayer != null && endTime > 0) {
+            if (activePlayer.equals(myName)) {
+                finalMessage += " (You have 30 seconds to act)";
+            } else {
+                long remainingMillis = endTime - getSynchronizedTime();
+                long remainingSeconds = Math.max(0, remainingMillis / 1000);
+                finalMessage += String.format(" (Time Left: %ds)", remainingSeconds);
+            }
         }
         
         System.out.println("===========================================================");
-        System.out.println("MESSAGE: " + state.getGameMessage());
+        System.out.println("MESSAGE: " + finalMessage);
         System.out.println("===========================================================");
     }
 
-    /**
-     * A simple utility to clear the console screen for a cleaner display.
-     */
+    private static int getHandValue(List<Card> hand) {
+        int value = 0;
+        int aceCount = 0;
+        if (hand == null) return 0;
+        for (Card card : hand) { value += card.getValue(); if (card.getValue() == 11) { aceCount++; } }
+        while (value > 21 && aceCount > 0) { value -= 10; aceCount--; }
+        return value;
+    }
+
     public final static void clearConsole() {
         for(int i = 0; i < 50; i++) System.out.println();
     }

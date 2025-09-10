@@ -8,28 +8,34 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class BlackjackServer extends UnicastRemoteObject implements BlackjackService {
     private enum GamePhase { BETTING, PLAYING, DEALER_TURN, PAYOUT }
 
     private List<Card> deck;
-    private List<Card> dealerHand;
-    private final Map<String, Player> players;
-    private GamePhase currentPhase;
-    private List<String> playerTurnOrder;
-    private int currentPlayerIndex;
-    private String message;
+    private List<Card> dealerHand = new ArrayList<>();
+    private final Map<String, Player> players = new ConcurrentHashMap<>();
+    private GamePhase currentPhase = GamePhase.BETTING;
+    private List<String> playerTurnOrder = new ArrayList<>();
+    private int currentPlayerIndex = -1;
+    private String message = "New round started. Please place your bets!";
 
-    public BlackjackServer() throws RemoteException {
+    private final ScheduledExecutorService turnTimerExecutor = Executors.newSingleThreadScheduledExecutor();
+    private Future<?> turnTimerFuture;
+    private long turnEndTime = 0;
+    private int turnId = 0;
+
+    protected BlackjackServer() throws RemoteException {
         super();
-        players = new ConcurrentHashMap<>();
-        dealerHand = new ArrayList<>();
-        playerTurnOrder = new ArrayList<>();
         startNewRound();
         System.out.println("Blackjack Server is ready.");
     }
-
+    
     private void logThreadLifecycle(String event, String methodName, String playerName) {
         try {
             String clientHost = RemoteServer.getClientHost();
@@ -40,20 +46,19 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
                 event, methodName, Thread.currentThread().getName());
         }
     }
-    
+
+    @Override
+    public long getServerTime() throws RemoteException {
+        return System.currentTimeMillis();
+    }
+
     @Override
     public synchronized String joinGame(String playerName) throws RemoteException {
         logThreadLifecycle("Thread Birth", "joinGame", playerName);
         try {
-            // ** THE FIX IS HERE **
-            // If a player with this name already exists, we assume they are reconnecting.
-            // This prevents a "ghost" session from stalling the game if the client restarts.
             if (players.containsKey(playerName)) {
-                System.out.printf("--- Player '%s' has reconnected. ---\n", playerName);
-                return "Welcome back, " + playerName + "!";
+                return "ERROR: Player name is already taken.";
             }
-            
-            // If the player is new, create a new Player object for them.
             players.put(playerName, new Player(playerName));
             System.out.printf("--- Player '%s' has joined the game. ---\n", playerName);
             return "Welcome to Blackjack, " + playerName + "!";
@@ -68,33 +73,36 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
         try {
             Player player = players.get(playerName);
             if (player == null || currentPhase != GamePhase.BETTING) return;
-            if (player.getMoney() >= amount && amount > 0) {
-                player.placeBet(amount);
-                player.setStatus(Player.Status.WAITING);
-            }
-            
-            if (allPlayersReady()) {
-                // This is a critical transition
+            player.placeBet(amount);
+            if (areAllBetsIn()) {
                 dealInitialCards();
             }
         } finally {
             logThreadLifecycle("Thread Death", "placeBet", playerName);
         }
     }
+
+    private boolean areAllBetsIn() {
+        if (players.isEmpty()) return false;
+        return players.values().stream().noneMatch(p -> p.getStatus() == Player.Status.WAITING_FOR_BET);
+    }
     
     @Override
     public synchronized void hit(String playerName) throws RemoteException {
         logThreadLifecycle("Thread Birth", "hit", playerName);
         try {
-            if (currentPhase != GamePhase.PLAYING || !isPlayerTurn(playerName)) return;
-            
+            if (!isPlayerTurn(playerName)) return;
+            cancelTurnTimer();
+            this.turnId++;
             Player player = players.get(playerName);
+            if(deck.isEmpty()) createNewDeck();
             player.getHand().add(deck.remove(0));
-            
             if (player.getHandValue() > 21) {
                 player.setStatus(Player.Status.BUSTED);
                 message = playerName + " busted!";
                 advanceTurn();
+            } else {
+                startTurnTimerFor(playerName);
             }
         } finally {
             logThreadLifecycle("Thread Death", "hit", playerName);
@@ -105,9 +113,11 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
     public synchronized void stand(String playerName) throws RemoteException {
         logThreadLifecycle("Thread Birth", "stand", playerName);
         try {
-            if (currentPhase != GamePhase.PLAYING || !isPlayerTurn(playerName)) return;
-            
-            players.get(playerName).setStatus(Player.Status.STANDING);
+            if (!isPlayerTurn(playerName)) return;
+            cancelTurnTimer();
+            this.turnId++;
+            Player player = players.get(playerName);
+            player.setStatus(Player.Status.STANDING);
             message = playerName + " stands.";
             advanceTurn();
         } finally {
@@ -115,137 +125,96 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
         }
     }
     
-    private boolean allPlayersReady() {
-        if (players.isEmpty()) {
-            return false;
-        }
-        boolean isAnyoneStillBetting = players.values().stream()
-                .anyMatch(p -> p.getStatus() == Player.Status.BETTING);
-        if (isAnyoneStillBetting) {
-            return false;
-        }
-        boolean hasAtLeastOneBet = players.values().stream()
-                .anyMatch(p -> p.getCurrentBet() > 0);
-        
-        if(hasAtLeastOneBet) {
-             System.out.println("[SERVER LOG] allPlayersReady is TRUE. Proceeding to deal.");
-        }
-
-        return hasAtLeastOneBet;
-    }
-
     private void dealInitialCards() {
-        System.out.println("[SERVER LOG] In dealInitialCards(). Setting phase to PLAYING.");
         currentPhase = GamePhase.PLAYING;
         playerTurnOrder = players.values().stream()
             .filter(p -> p.getCurrentBet() > 0)
             .map(Player::getName)
             .collect(Collectors.toList());
         
-        if(playerTurnOrder.isEmpty()){
-            message = "No bets placed. Starting new round...";
-            startNewRound();
-            return;
-        }
-
-        System.out.println("[SERVER LOG] Player turn order: " + playerTurnOrder);
+        if(playerTurnOrder.isEmpty()) { startNewRound(); return; }
 
         for (int i = 0; i < 2; i++) {
-            for (String playerName : playerTurnOrder) {
-                players.get(playerName).getHand().add(deck.remove(0));
+            for (String name : playerTurnOrder) {
+                if (deck.isEmpty()) createNewDeck();
+                players.get(name).getHand().add(deck.remove(0));
             }
+            if (deck.isEmpty()) createNewDeck();
             dealerHand.add(deck.remove(0));
         }
-        for (String playerName : playerTurnOrder) {
-            players.get(playerName).setStatus(Player.Status.PLAYING);
-        }
+
         currentPlayerIndex = 0;
-        updateTurnAndMessage();
+        String firstPlayer = playerTurnOrder.get(currentPlayerIndex);
+        players.get(firstPlayer).setStatus(Player.Status.PLAYING_TURN);
+        message = "It's " + firstPlayer + "'s turn.";
+        startTurnTimerFor(firstPlayer);
     }
     
-    private void updateTurnAndMessage() {
+    private void advanceTurn() {
+        if (currentPlayerIndex < playerTurnOrder.size()) {
+            String currentPlayerName = playerTurnOrder.get(currentPlayerIndex);
+            Player currentPlayer = players.get(currentPlayerName);
+            if (currentPlayer != null && currentPlayer.getStatus() == Player.Status.PLAYING_TURN) {
+                currentPlayer.setStatus(Player.Status.WAITING_FOR_TURN);
+            }
+        }
+        
+        currentPlayerIndex++;
+
         if (currentPlayerIndex >= playerTurnOrder.size()) {
-            System.out.println("[SERVER LOG] All players have played. Moving to DEALER_TURN.");
+            turnEndTime = 0;
             currentPhase = GamePhase.DEALER_TURN;
             dealerPlays();
         } else {
-            String currentName = playerTurnOrder.get(currentPlayerIndex);
-            message = "It's " + currentName + "'s turn. Hit or Stand?";
-            System.out.println("[SERVER LOG] Turn updated. It is now " + currentName + "'s turn.");
+            String nextPlayerName = playerTurnOrder.get(currentPlayerIndex);
+            players.get(nextPlayerName).setStatus(Player.Status.PLAYING_TURN);
+            message = "It's " + nextPlayerName + "'s turn.";
+            startTurnTimerFor(nextPlayerName);
         }
     }
 
-    private void advanceTurn() {
-        currentPlayerIndex++;
-        System.out.println("[SERVER LOG] Advancing turn. New player index: " + currentPlayerIndex);
-        updateTurnAndMessage();
-    }
-
-    @Override
-    public synchronized GameState getGameState() throws RemoteException {
-        Map<String, List<Card>> playerHands = new ConcurrentHashMap<>();
-        Map<String, Double> playerMoney = new ConcurrentHashMap<>();
-        Map<String, Double> playerBets = new ConcurrentHashMap<>();
-        Map<String, Player.Status> playerStati = new ConcurrentHashMap<>();
-        
-        for(Player p : players.values()){
-            playerHands.put(p.getName(), new ArrayList<>(p.getHand()));
-            playerMoney.put(p.getName(), p.getMoney());
-            playerBets.put(p.getName(), p.getCurrentBet());
-            playerStati.put(p.getName(), p.getStatus());
-        }
-        
-        List<Card> visibleDealerHand = new ArrayList<>();
-        if (currentPhase == GamePhase.PLAYING && !dealerHand.isEmpty()) {
-            visibleDealerHand.add(dealerHand.get(0));
-            visibleDealerHand.add(new Card("?", "Hidden", 0));
-        } else {
-            visibleDealerHand.addAll(dealerHand);
-        }
-        
-        String currentTurnPlayer = (currentPhase == GamePhase.PLAYING && currentPlayerIndex < playerTurnOrder.size())
-            ? playerTurnOrder.get(currentPlayerIndex) : null;
-            
-        return new GameState(visibleDealerHand, playerHands, playerMoney, playerBets, playerStati, message, currentTurnPlayer);
-    }
-    
-    private void startNewRound() {
-        currentPhase = GamePhase.BETTING;
-        message = "New round started. Please place your bets!";
-        dealerHand.clear();
-        playerTurnOrder.clear();
-        currentPlayerIndex = -1;
-        for(Player player : players.values()){
-            player.clearHandAndBet();
-            player.setStatus(Player.Status.BETTING);
-        }
-        deck = new ArrayList<>();
-        String[] suits = {"Hearts", "Diamonds", "Clubs", "Spades"};
-        String[] ranks = {"2", "3", "4", "5", "6", "7", "8", "9", "10", "Jack", "Queen", "King", "Ace"};
-        int[] values = {2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11};
-        for (String suit : suits) {
-            for (int i = 0; i < ranks.length; i++) {
-                deck.add(new Card(suit, ranks[i], values[i]));
+    private void startTurnTimerFor(String playerName) {
+        cancelTurnTimer();
+        this.turnId++;
+        final int currentTurnId = this.turnId;
+        turnEndTime = System.currentTimeMillis() + 30000;
+        Runnable forceStandTask = () -> {
+            synchronized(BlackjackServer.this) {
+                if (isPlayerTurn(playerName) && BlackjackServer.this.turnId == currentTurnId) {
+                    System.out.println("\n[SERVER] Player '" + playerName + "' ran out of time. Forcing stand.");
+                    try { stand(playerName); } catch (RemoteException e) { e.printStackTrace(); }
+                }
             }
-        }
-        Collections.shuffle(deck);
-        System.out.println("--- New Round Started ---");
+        };
+        turnTimerFuture = turnTimerExecutor.schedule(forceStandTask, 30, TimeUnit.SECONDS);
     }
     
+    private void cancelTurnTimer() {
+        turnEndTime = 0;
+        if (turnTimerFuture != null && !turnTimerFuture.isDone()) {
+            turnTimerFuture.cancel(false);
+        }
+    }
+
     private void dealerPlays() {
         message = "Dealer is playing...";
         while (getHandValue(dealerHand) < 17) {
+            if (deck.isEmpty()) createNewDeck();
             dealerHand.add(deck.remove(0));
         }
         resolveBets();
     }
+
     private void resolveBets() {
         currentPhase = GamePhase.PAYOUT;
         int dealerValue = getHandValue(dealerHand);
+        
         StringBuilder resultMessage = new StringBuilder("Dealer has " + dealerValue + ". ");
+
         for (String playerName : playerTurnOrder) {
             Player player = players.get(playerName);
             int playerValue = player.getHandValue();
+
             if (player.getStatus() == Player.Status.BUSTED) {
                 resultMessage.append(String.format("%s busted. ", playerName));
             } else if (dealerValue > 21 || playerValue > dealerValue) {
@@ -259,41 +228,85 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
             }
         }
         message = resultMessage.toString();
+        
+        // FIX: Wait for 8 seconds on the results screen before starting a new round.
         new Thread(() -> {
             try {
-                Thread.sleep(5000);
-                synchronized(BlackjackServer.this) {
-                    startNewRound();
-                }
+                Thread.sleep(8000);
+                synchronized(BlackjackServer.this) { startNewRound(); }
             } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }).start();
     }
-    private boolean isPlayerTurn(String playerName) {
-        if (playerTurnOrder.isEmpty() || currentPlayerIndex >= playerTurnOrder.size()) return false;
-        return playerTurnOrder.get(currentPlayerIndex).equals(playerName);
+    
+    private void startNewRound() {
+        message = "New round started. Please place your bets!";
+        currentPhase = GamePhase.BETTING;
+        dealerHand.clear();
+        playerTurnOrder.clear();
+        currentPlayerIndex = -1;
+        turnEndTime = 0;
+        
+        for(Player player : players.values()){ player.resetForNewRound(); }
+        
+        if (deck == null || deck.size() < 20) { createNewDeck(); }
     }
     
+    private void createNewDeck() {
+        deck = new ArrayList<>();
+        String[] suits = {"Hearts", "Diamonds", "Clubs", "Spades"};
+        String[] ranks = {"2", "3", "4", "5", "6", "7", "8", "9", "10", "Jack", "Queen", "King", "Ace"};
+        int[] values = {2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11};
+        for (String suit : suits) {
+            for (int i = 0; i < ranks.length; i++) {
+                deck.add(new Card(suit, ranks[i], values[i]));
+            }
+        }
+        Collections.shuffle(deck);
+    }
+
+    @Override
+    public synchronized GameState getGameState() throws RemoteException {
+        Map<String, List<Card>> playerHands = new ConcurrentHashMap<>();
+        Map<String, Double> playerMoney = new ConcurrentHashMap<>();
+        Map<String, Double> playerBets = new ConcurrentHashMap<>();
+        Map<String, Player.Status> playerStati = new ConcurrentHashMap<>();
+        for(Player p : players.values()){
+            playerHands.put(p.getName(), new ArrayList<>(p.getHand()));
+            playerMoney.put(p.getName(), p.getMoney());
+            playerBets.put(p.getName(), p.getCurrentBet());
+            playerStati.put(p.getName(), p.getStatus());
+        }
+        
+        List<Card> visibleDealerHand = new ArrayList<>(dealerHand);
+        if (currentPhase == GamePhase.PLAYING && dealerHand.size() > 1) {
+            visibleDealerHand.clear();
+            visibleDealerHand.add(dealerHand.get(0));
+            visibleDealerHand.add(new Card("?", "Hidden", 0));
+        }
+        
+        String currentTurnPlayer = (currentPhase == GamePhase.PLAYING && currentPlayerIndex < playerTurnOrder.size())
+            ? playerTurnOrder.get(currentPlayerIndex) : null;
+            
+        return new GameState(visibleDealerHand, playerHands, playerMoney, playerBets, playerStati, message, currentTurnPlayer, turnEndTime);
+    }
+
+    private boolean isPlayerTurn(String playerName) {
+        if (currentPhase != GamePhase.PLAYING || currentPlayerIndex >= playerTurnOrder.size() || playerName == null) return false;
+        return playerName.equals(playerTurnOrder.get(currentPlayerIndex));
+    }
+
     private int getHandValue(List<Card> hand) {
         int value = 0;
         int aceCount = 0;
-        for (Card card : hand) {
-            value += card.getValue();
-            if (card.getValue() == 11) aceCount++;
-        }
-        while (value > 21 && aceCount > 0) {
-            value -= 10;
-            aceCount--;
-        }
+        for (Card card : hand) { value += card.getValue(); if (card.getValue() == 11) aceCount++; }
+        while (value > 21 && aceCount > 0) { value -= 10; aceCount--; }
         return value;
     }
 
     public static void main(String[] args) {
         try {
-            BlackjackServer server = new BlackjackServer();
             Registry registry = LocateRegistry.createRegistry(1099);
-            registry.rebind("BlackjackService", server);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+            registry.rebind("BlackjackService", new BlackjackServer());
+        } catch (Exception e) { e.printStackTrace(); }
     }
 }
