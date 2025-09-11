@@ -15,7 +15,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class BlackjackServer extends UnicastRemoteObject implements BlackjackService {
-    private enum GamePhase { BETTING, PLAYING, DEALER_TURN, PAYOUT }
+    private enum GamePhase { BETTING, PLAYING, DEALER_TURN, PAYOUT, ELECTION }
+    private static final long HEARTBEAT_TIMEOUT_MS = 15000; // 15 seconds
 
     private List<Card> deck;
     private List<Card> dealerHand = new ArrayList<>();
@@ -23,17 +24,27 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
     private GamePhase currentPhase = GamePhase.BETTING;
     private List<String> playerTurnOrder = new ArrayList<>();
     private int currentPlayerIndex = -1;
-    private String message = "New round started. Please place your bets!";
+    private String message = "Waiting for players to join.";
 
     private final ScheduledExecutorService turnTimerExecutor = Executors.newSingleThreadScheduledExecutor();
     private Future<?> turnTimerFuture;
     private long turnEndTime = 0;
     private int turnId = 0;
 
+    // State for Ring Election
+    private String dealerName = null;
+    private int nextPriority = 0;
+    private final Map<String, Integer> playerPriorities = new ConcurrentHashMap<>();
+    private final List<String> playerRing = Collections.synchronizedList(new ArrayList<>());
+    private ElectionMessage currentElectionMessage = null;
+
+    // State for Heartbeat
+    private final Map<String, Long> lastHeartbeats = new ConcurrentHashMap<>();
+
     protected BlackjackServer() throws RemoteException {
         super();
-        startNewRound();
         System.out.println("Blackjack Server is ready.");
+        new Thread(this::monitorHeartbeats).start();
     }
     
     private void logThreadLifecycle(String event, String methodName, String playerName) {
@@ -51,6 +62,45 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
     public long getServerTime() throws RemoteException {
         return System.currentTimeMillis();
     }
+    
+    @Override
+    public synchronized void heartbeat(String playerName) throws RemoteException {
+        lastHeartbeats.put(playerName, System.currentTimeMillis());
+    }
+
+    private void monitorHeartbeats() {
+        while (true) {
+            try {
+                Thread.sleep(5000); // Check every 5 seconds
+                long now = System.currentTimeMillis();
+                for (String playerName : lastHeartbeats.keySet()) {
+                    if (now - lastHeartbeats.get(playerName) > HEARTBEAT_TIMEOUT_MS) {
+                        System.out.println("[HEARTBEAT] Player '" + playerName + "' timed out.");
+                        removePlayer(playerName);
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private synchronized void removePlayer(String playerName) {
+        players.remove(playerName);
+        playerPriorities.remove(playerName);
+        playerRing.remove(playerName);
+        lastHeartbeats.remove(playerName);
+        System.out.println("--- Player '" + playerName + "' has been removed from the game. ---");
+
+        if (playerName.equals(dealerName)) {
+            System.out.println("[ELECTION] Dealer '" + dealerName + "' disconnected. A new election is required.");
+            dealerName = null;
+            currentElectionMessage = null;
+            if (!playerRing.isEmpty()) {
+                startElection(playerRing.get(0));
+            }
+        }
+    }
 
     @Override
     public synchronized String joinGame(String playerName) throws RemoteException {
@@ -60,13 +110,22 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
                 return "ERROR: Player name is already taken.";
             }
             players.put(playerName, new Player(playerName));
-            System.out.printf("--- Player '%s' has joined the game. ---\n", playerName);
+            playerPriorities.put(playerName, nextPriority);
+            playerRing.add(playerName);
+            lastHeartbeats.put(playerName, System.currentTimeMillis());
+            nextPriority++;
+
+            System.out.printf("--- Player '%s' (Priority: %d) has joined the game. ---\n", playerName, playerPriorities.get(playerName));
+            
+            if (dealerName == null && currentElectionMessage == null && players.size() > 0) {
+                startElection(playerRing.get(0));
+            }
             return "Welcome to Blackjack, " + playerName + "!";
         } finally {
             logThreadLifecycle("Thread Death", "joinGame", playerName);
         }
     }
-
+    
     @Override
     public synchronized void placeBet(String playerName, double amount) throws RemoteException {
         logThreadLifecycle("Thread Birth", "placeBet", playerName);
@@ -83,8 +142,10 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
     }
 
     private boolean areAllBetsIn() {
-        if (players.isEmpty()) return false;
-        return players.values().stream().noneMatch(p -> p.getStatus() == Player.Status.WAITING_FOR_BET);
+        if (players.isEmpty() || dealerName == null) return false;
+        long bettingPlayers = players.values().stream().filter(p -> !p.getName().equals(dealerName)).count();
+        if (bettingPlayers == 0) return false;
+        return players.values().stream().filter(p -> !p.getName().equals(dealerName)).noneMatch(p -> p.getStatus() == Player.Status.WAITING_FOR_BET);
     }
     
     @Override
@@ -182,7 +243,7 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
             synchronized(BlackjackServer.this) {
                 if (isPlayerTurn(playerName) && BlackjackServer.this.turnId == currentTurnId) {
                     System.out.println("\n[SERVER] Player '" + playerName + "' ran out of time. Forcing stand.");
-                    try { stand(playerName); } catch (RemoteException e) { e.printStackTrace(); }
+                    try { stand(playerName); } catch (RemoteException e) { /* Player likely disconnected */ }
                 }
             }
         };
@@ -197,7 +258,7 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
     }
 
     private void dealerPlays() {
-        message = "Dealer is playing...";
+        message = "Dealer (" + dealerName + ") is playing...";
         while (getHandValue(dealerHand) < 17) {
             if (deck.isEmpty()) createNewDeck();
             dealerHand.add(deck.remove(0));
@@ -209,10 +270,11 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
         currentPhase = GamePhase.PAYOUT;
         int dealerValue = getHandValue(dealerHand);
         
-        StringBuilder resultMessage = new StringBuilder("Dealer has " + dealerValue + ". ");
+        StringBuilder resultMessage = new StringBuilder("Dealer (" + dealerName + ") has " + dealerValue + ". ");
 
         for (String playerName : playerTurnOrder) {
             Player player = players.get(playerName);
+            if (player == null) continue;
             int playerValue = player.getHandValue();
 
             if (player.getStatus() == Player.Status.BUSTED) {
@@ -229,7 +291,6 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
         }
         message = resultMessage.toString();
         
-        // FIX: Wait for 8 seconds on the results screen before starting a new round.
         new Thread(() -> {
             try {
                 Thread.sleep(8000);
@@ -239,6 +300,13 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
     }
     
     private void startNewRound() {
+        if (dealerName == null) {
+            if (currentElectionMessage == null && !playerRing.isEmpty()) {
+                startElection(playerRing.get(0));
+            }
+            return;
+        }
+
         message = "New round started. Please place your bets!";
         currentPhase = GamePhase.BETTING;
         dealerHand.clear();
@@ -284,10 +352,46 @@ public class BlackjackServer extends UnicastRemoteObject implements BlackjackSer
             visibleDealerHand.add(new Card("?", "Hidden", 0));
         }
         
-        String currentTurnPlayer = (currentPhase == GamePhase.PLAYING && currentPlayerIndex < playerTurnOrder.size())
+        String currentTurnPlayer = (currentPhase == GamePhase.PLAYING && currentPlayerIndex >=0 && currentPlayerIndex < playerTurnOrder.size())
             ? playerTurnOrder.get(currentPlayerIndex) : null;
             
-        return new GameState(visibleDealerHand, playerHands, playerMoney, playerBets, playerStati, message, currentTurnPlayer, turnEndTime);
+        return new GameState(visibleDealerHand, playerHands, playerMoney, playerBets, playerStati, message, currentTurnPlayer, turnEndTime, dealerName, currentElectionMessage, playerPriorities);
+    }
+
+    private synchronized void startElection(String initiatorPlayerName) {
+        if (currentElectionMessage != null || playerRing.isEmpty()) return;
+
+        System.out.println("[ELECTION] " + initiatorPlayerName + " started an election.");
+        currentPhase = GamePhase.ELECTION;
+        message = "No dealer found. Election in progress...";
+        int initiatorPriority = playerPriorities.get(initiatorPlayerName);
+        String nextPlayer = getNextPlayerInRing(initiatorPlayerName);
+        
+        currentElectionMessage = new ElectionMessage(initiatorPriority, initiatorPlayerName, nextPlayer);
+    }
+
+    @Override
+    public synchronized void passElectionMessage(ElectionMessage message) throws RemoteException {
+        System.out.println("[ELECTION] Received message with candidate ID: " + message.getCandidateId() + " for " + message.getNextRecipientName());
+        this.currentElectionMessage = message;
+    }
+
+    @Override
+    public synchronized void claimDealership(String winnerPlayerName) throws RemoteException {
+        System.out.println("[ELECTION] " + winnerPlayerName + " has won the election and is the new dealer.");
+        this.dealerName = winnerPlayerName;
+        this.currentElectionMessage = null;
+        this.message = winnerPlayerName + " is the new dealer.";
+        startNewRound();
+    }
+
+    private String getNextPlayerInRing(String currentPlayerName) {
+        int currentIndex = playerRing.indexOf(currentPlayerName);
+        if (currentIndex == -1 || playerRing.isEmpty()) {
+            return currentPlayerName;
+        }
+        int nextIndex = (currentIndex + 1) % playerRing.size();
+        return playerRing.get(nextIndex);
     }
 
     private boolean isPlayerTurn(String playerName) {
